@@ -36,6 +36,72 @@ var BigChunk [MaxChunkSize]byte
 
 var bigbuff [16 * 1024 * 1024]byte
 
+var times = flag.Int("times", 1000, "number of requests to send simultaneously")
+var optServer = flag.Bool("s", false, "server mode only")
+var optClient = flag.String("c", "", "client only mode, connect to url")
+var optH2C = flag.Bool("h2c", false, "force h2c")
+var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
+var optT1 = flag.Bool("t1", true, "do predifined test 1")
+var optT2 = flag.Bool("t2", true, "do predifined test 2")
+var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
+
+func main() {
+
+	flag.Parse()
+
+	if *optCpuProfile != "" {
+		runtime.SetBlockProfileRate(1)
+		f, err := os.Create(*optCpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer func() {
+			// fmt.Println("StopCPUProfile")
+			pprof.StopCPUProfile()
+		}()
+	}
+
+	StreamPathRegexp = regexp.MustCompile("^(" + "[0-9]+" + ")$")
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	if *optClient == "" {
+		ready := make(chan bool)
+
+		// 1. create a http server
+		go createServer(ctx, "", 8765, true, &wg, ready)
+		<-ready
+		fmt.Printf("server created and listening at %s (http1.1)\n", "8765")
+
+		// 2. create a http/2 (h2c) server
+		go createServer(ctx, "", 9876, true, &wg, ready)
+		<-ready
+		fmt.Printf("server created and listening at %s (http/2 cleartext)\n", "9876")
+
+		// if server mode, just wait forever for something else to cancel
+		if *optServer {
+			fmt.Printf("server mode on\n")
+			<-ctx.Done()
+			return
+		}
+	} else {
+		doClient(ctx, *optClient, *optH2C)
+		return
+	}
+
+	if *optT1 {
+		doClient(ctx, fmt.Sprintf("http://localhost:8765/%d", *optSize), false)
+	}
+	if *optT2 {
+		doClient(ctx, fmt.Sprintf("http://localhost:9876/%d", *optSize), true)
+	}
+	cancel()
+	wg.Wait()
+}
+
 func InitBigChunk(seed int64) {
 	rng := rand.New(rand.NewSource(seed))
 	for i := int64(0); i < MaxChunkSize; i++ {
@@ -265,17 +331,15 @@ func Download(ctx context.Context, url string, useH2C bool) error {
 
 	var body io.ReadCloser = http.NoBody
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, body)
-	if err != nil {
-		return err
-	}
 	wg := sync.WaitGroup{}
 
-	metircs := make([]*Metrics, 0, 10)
+	metircs := make([]*Metrics, 0, *times)
 	var mu sync.Mutex
-	wg.Add(10)
-	for i := 0; i < 10; i++ {
+	wg.Add(*times)
+	for i := 0; i < *times; i++ {
 		go func() {
+			req, _ := http.NewRequestWithContext(context.Background(), "GET", url, body)
+
 			defer wg.Done()
 			resp, err := rt.RoundTrip(req)
 
@@ -292,15 +356,29 @@ func Download(ctx context.Context, url string, useH2C bool) error {
 				mu.Lock()
 				defer mu.Unlock()
 				metircs = append(metircs, &wm)
+			} else {
+				log.Println(err)
 			}
 		}()
 	}
 
-	for _, wm := range metircs {
-		fmt.Printf("client received %d bytes in %v = %s, %d write ops, %d buff \n", wm.TotalRead, wm.ElapsedTime, FormatBitperSecond(wm.ElapsedTime.Seconds(), wm.TotalRead), wm.ReadCount, wm.StepSize)
-
-	}
 	wg.Wait()
+	var totalSeconds float64
+	var totalRead int64
+	var totalElapsedTime time.Duration
+	var speeds int64
+	for _, wm := range metircs {
+		totalSeconds += wm.ElapsedTime.Seconds()
+		totalElapsedTime += wm.ElapsedTime
+		totalRead += wm.TotalRead
+		speeds += speed(wm.ElapsedTime.Seconds(), wm.TotalRead)
+		// fmt.Printf("client received %d bytes in %v = %s, %d write ops, %d buff \n",
+		// 	wm.TotalRead, wm.ElapsedTime, FormatBitperSecond(wm.ElapsedTime.Seconds(), wm.TotalRead), wm.ReadCount, wm.StepSize)
+	}
+
+	fmt.Printf("+++client totally received %d bytes in %v = %s\n", totalRead, totalElapsedTime,
+		ByteCountDecimal(speeds/int64(*times)))
+
 	return nil
 }
 
@@ -314,72 +392,11 @@ func doClient(ctx context.Context, url string, h2c bool) error {
 	return err
 }
 
-var optServer = flag.Bool("s", false, "server mode only")
-var optClient = flag.String("c", "", "client only mode, connect to url")
-var optH2C = flag.Bool("h2c", false, "force h2c")
-var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
-var optT1 = flag.Bool("t1", true, "do predifined test 1")
-var optT2 = flag.Bool("t2", true, "do predifined test 2")
-var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
-
-func main() {
-
-	flag.Parse()
-
-	if *optCpuProfile != "" {
-		runtime.SetBlockProfileRate(1)
-		f, err := os.Create(*optCpuProfile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		pprof.StartCPUProfile(f)
-		defer func() {
-			// fmt.Println("StopCPUProfile")
-			pprof.StopCPUProfile()
-		}()
-	}
-
-	StreamPathRegexp = regexp.MustCompile("^(" + "[0-9]+" + ")$")
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	var wg sync.WaitGroup
-
-	if *optClient == "" {
-		ready := make(chan bool)
-
-		// 1. create a http server
-		go createServer(ctx, "", 8765, true, &wg, ready)
-		<-ready
-		fmt.Printf("server created and listening at %s (http1.1)\n", "8765")
-
-		// 2. create a http/2 (h2c) server
-		go createServer(ctx, "", 9876, true, &wg, ready)
-		<-ready
-		fmt.Printf("server created and listening at %s (http/2 cleartext)\n", "9876")
-
-		// if server mode, just wait forever for something else to cancel
-		if *optServer {
-			fmt.Printf("server mode on\n")
-			<-ctx.Done()
-			return
-		}
-	} else {
-		doClient(ctx, *optClient, *optH2C)
-		return
-	}
-
-	if *optT1 {
-		doClient(ctx, fmt.Sprintf("http://localhost:8765/%d", *optSize), false)
-	}
-	if *optT2 {
-		doClient(ctx, fmt.Sprintf("http://localhost:9876/%d", *optSize), true)
-	}
-	cancel()
-	wg.Wait()
-}
-
 // human friendly formatting stuff
+
+func speed(elapsedSeconds float64, totalBytes int64) int64 {
+	return (int64)(((float64)(totalBytes) * 8.0) / elapsedSeconds)
+}
 
 // FormatBitperSecond format bit per seconds in human readable format
 func FormatBitperSecond(elapsedSeconds float64, totalBytes int64) string {
