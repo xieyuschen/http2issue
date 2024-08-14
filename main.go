@@ -121,7 +121,7 @@ func createHandler() http.Handler {
 // handle the only route: '/number' which send <number> bytes of random data
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 
-	//fmt.Printf("request from %s: %s\n", r.RemoteAddr, r.URL)
+	// fmt.Printf("request from %s: %s\n", r.RemoteAddr, r.URL)
 	method := r.Method
 	if method == "" {
 		method = "GET"
@@ -176,7 +176,7 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	//fmt.Printf("header sent to %s: %s\n", r.RemoteAddr, r.URL)
+	// fmt.Printf("header sent to %s: %s\n", r.RemoteAddr, r.URL)
 
 	startTime := time.Now()
 
@@ -214,7 +214,9 @@ func createServer(ctx context.Context, host string, port int, useH2C bool, wg *s
 		Handler: createHandler(),
 	}
 	if useH2C {
-		server.Handler = h2c.NewHandler(server.Handler, &http2.Server{})
+		server.Handler = h2c.NewHandler(server.Handler, &http2.Server{
+			MaxReadFrameSize: 1<<24 - 1,
+		})
 	}
 
 	ln, err := net.Listen("tcp", server.Addr)
@@ -257,7 +259,7 @@ func Download(ctx context.Context, url string, useH2C bool) error {
 			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
 				return dialer.Dial(network, addr)
 			},
-			MaxReadFrameSize: 256 * 1024, // for perf fix since cl: https://go-review.googlesource.com/c/net/+/362834
+			MaxReadFrameSize: 1<<24 - 1, // for perf fix since cl: https://go-review.googlesource.com/c/net/+/362834
 		}
 	}
 
@@ -267,22 +269,39 @@ func Download(ctx context.Context, url string, useH2C bool) error {
 	if err != nil {
 		return err
 	}
+	wg := sync.WaitGroup{}
 
-	resp, err := rt.RoundTrip(req)
+	metircs := make([]*Metrics, 0, 10)
+	var mu sync.Mutex
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			resp, err := rt.RoundTrip(req)
 
-	if err == nil && resp != nil {
-		fmt.Printf("receiving data with %s\n", resp.Proto)
-		wm := Metrics{}
-		_, err = io.CopyBuffer(&wm, resp.Body, bigbuff[:])
-		resp.Body.Close()
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				return err
+			if err == nil && resp != nil {
+				fmt.Printf("receiving data with %s\n", resp.Proto)
+				wm := Metrics{}
+				_, err = io.CopyBuffer(&wm, resp.Body, bigbuff[:])
+				resp.Body.Close()
+				if err != nil {
+					if !errors.Is(err, io.EOF) {
+						panic(err)
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				metircs = append(metircs, &wm)
 			}
-		}
-		fmt.Printf("client received %d bytes in %v = %s, %d write ops, %d buff \n", wm.TotalRead, wm.ElapsedTime, FormatBitperSecond(wm.ElapsedTime.Seconds(), wm.TotalRead), wm.ReadCount, wm.StepSize)
+		}()
 	}
-	return err
+
+	for _, wm := range metircs {
+		fmt.Printf("client received %d bytes in %v = %s, %d write ops, %d buff \n", wm.TotalRead, wm.ElapsedTime, FormatBitperSecond(wm.ElapsedTime.Seconds(), wm.TotalRead), wm.ReadCount, wm.StepSize)
+
+	}
+	wg.Wait()
+	return nil
 }
 
 // client just like "curl -o /dev/null url"
@@ -315,7 +334,7 @@ func main() {
 		}
 		pprof.StartCPUProfile(f)
 		defer func() {
-			//fmt.Println("StopCPUProfile")
+			// fmt.Println("StopCPUProfile")
 			pprof.StopCPUProfile()
 		}()
 	}
@@ -329,12 +348,12 @@ func main() {
 	if *optClient == "" {
 		ready := make(chan bool)
 
-		//1. create a http server
+		// 1. create a http server
 		go createServer(ctx, "", 8765, true, &wg, ready)
 		<-ready
 		fmt.Printf("server created and listening at %s (http1.1)\n", "8765")
 
-		//2. create a http/2 (h2c) server
+		// 2. create a http/2 (h2c) server
 		go createServer(ctx, "", 9876, true, &wg, ready)
 		<-ready
 		fmt.Printf("server created and listening at %s (http/2 cleartext)\n", "9876")
